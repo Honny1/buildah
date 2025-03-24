@@ -101,10 +101,12 @@ var (
 	testDate            = time.Unix(1485449953, 0)
 	compareLayers       = false
 	compareImagebuilder = false
+	reproducibleBuild   = false
 	testDataDir         = ""
 	dockerDir           = ""
 	imagebuilderDir     = ""
 	buildahDir          = ""
+	buildahDirB         = ""
 	contextCanDoXattrs  *bool
 	storageCanDoXattrs  *bool
 )
@@ -123,6 +125,7 @@ func TestMain(m *testing.M) {
 
 	flag.StringVar(&logLevel, "log-level", "error", "buildah logging log level")
 	flag.BoolVar(&compareLayers, "compare-layers", compareLayers, "compare instruction-by-instruction")
+	flag.BoolVar(&reproducibleBuild, "reproducible-build", reproducibleBuild, "compare two container images builds created with Buildah to ensure they are reproducible")
 	flag.BoolVar(&compareImagebuilder, "compare-imagebuilder", compareImagebuilder, "also compare using imagebuilder")
 	flag.StringVar(&testDataDir, "testdata", testDataDir, "location of conformance testdata")
 	flag.StringVar(&dockerDir, "docker-dir", dockerDir, "location to save docker build results")
@@ -140,6 +143,10 @@ func TestMain(m *testing.M) {
 	}
 	if buildahDir == "" {
 		buildahDir = filepath.Join(tempdir, "buildah")
+	}
+	if reproducibleBuild {
+		buildahDirB = filepath.Join(buildahDir, "second")
+		buildahDir = filepath.Join(buildahDir, "first")
 	}
 	if dockerDir == "" {
 		dockerDir = filepath.Join(tempdir, "docker")
@@ -201,6 +208,43 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+func initStore(t *testing.T, rootDir string, runrootDir string) storage.Store {
+	options := storage.StoreOptions{
+		GraphDriverName:     os.Getenv("STORAGE_DRIVER"),
+		GraphRoot:           rootDir,
+		RunRoot:             runrootDir,
+		RootlessStoragePath: rootDir,
+	}
+
+	store, err := storage.GetStore(options)
+	require.NoErrorf(t, err, "error creating buildah storage at %q", rootDir)
+	return store
+}
+
+func checkIfStorageCanDoXattrs(t *testing.T, store storage.Store) {
+	layer, err := store.CreateLayer("", "", nil, "", true, nil)
+	if err != nil {
+		require.NoErrorf(t, err, "error creating test layer to check if xattrs are testable: %v", err)
+	}
+	mountPoint, err := store.Mount(layer.ID, "")
+	if err != nil {
+		require.NoErrorf(t, err, "error mounting test layer to check if xattrs are testable: %v", err)
+	}
+	testFile := filepath.Join(mountPoint, "testfile")
+	if err := os.WriteFile(testFile, []byte("whatever"), 0o600); err != nil {
+		require.NoErrorf(t, err, "error creating file in test layer to check if xattrs are testable: %v", err)
+	}
+	can := false
+	if err := copier.Lsetxattrs(testFile, map[string]string{"user.test": "test"}); err == nil {
+		can = true
+	}
+	storageCanDoXattrs = &can
+	err = store.DeleteLayer(layer.ID)
+	if err != nil {
+		require.NoErrorf(t, err, "error removing test layer after checking if xattrs are testable: %v", err)
+	}
+}
+
 func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, mutate func(*testCase)) {
 	test := internalTestCases[testIndex]
 	if mutate != nil {
@@ -218,6 +262,10 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 	contextDir := filepath.Join(tempdir, "context")
 	rootDir := filepath.Join(tempdir, "root")
 	runrootDir := filepath.Join(tempdir, "runroot")
+
+	var storeB storage.Store
+	rootDirB := filepath.Join(tempdir, "storeB", "root")
+	runrootDirB := filepath.Join(tempdir, "storeB", "runroot")
 
 	// check if we can test xattrs where we're storing build contexts
 	if contextCanDoXattrs == nil {
@@ -294,15 +342,7 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 		dockerfileContents = contents
 	}
 
-	// initialize storage for buildah
-	options := storage.StoreOptions{
-		GraphDriverName:     os.Getenv("STORAGE_DRIVER"),
-		GraphRoot:           rootDir,
-		RunRoot:             runrootDir,
-		RootlessStoragePath: rootDir,
-	}
-	store, err := storage.GetStore(options)
-	require.NoErrorf(t, err, "error creating buildah storage at %q", rootDir)
+	store := initStore(t, rootDir, runrootDir)
 	defer func() {
 		if store != nil {
 			_, err := store.Shutdown(true)
@@ -311,32 +351,24 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 	}()
 	storageDriver := store.GraphDriverName()
 	storageRoot := store.GraphRoot()
-
-	// now that we have a Store, check if we can test xattrs in storage layers
 	if storageCanDoXattrs == nil {
-		layer, err := store.CreateLayer("", "", nil, "", true, nil)
-		if err != nil {
-			require.NoErrorf(t, err, "error creating test layer to check if xattrs are testable: %v", err)
-		}
-		mountPoint, err := store.Mount(layer.ID, "")
-		if err != nil {
-			require.NoErrorf(t, err, "error mounting test layer to check if xattrs are testable: %v", err)
-		}
-		testFile := filepath.Join(mountPoint, "testfile")
-		if err := os.WriteFile(testFile, []byte("whatever"), 0o600); err != nil {
-			require.NoErrorf(t, err, "error creating file in test layer to check if xattrs are testable: %v", err)
-		}
-		can := false
-		if err := copier.Lsetxattrs(testFile, map[string]string{"user.test": "test"}); err == nil {
-			can = true
-		}
-		storageCanDoXattrs = &can
-		err = store.DeleteLayer(layer.ID)
-		if err != nil {
-			require.NoErrorf(t, err, "error removing test layer after checking if xattrs are testable: %v", err)
-		}
+		checkIfStorageCanDoXattrs(t, store)
 	}
 
+	if reproducibleBuild {
+		storeB = initStore(t, rootDirB, runrootDirB)
+		defer func() {
+			if storeB != nil {
+				_, err := storeB.Shutdown(true)
+				require.NoError(t, err, "error shutting down storage for buildah")
+			}
+		}()
+
+		// now that we have a Store, check if we can test xattrs in storage layers
+		if storageCanDoXattrs == nil {
+			checkIfStorageCanDoXattrs(t, storeB)
+		}
+	}
 	// connect to dockerd using the docker client library
 	dockerClient, err := dockerdockerclient.NewClientWithOpts(dockerdockerclient.FromEnv)
 	require.NoError(t, err, "unable to initialize docker.client")
@@ -378,7 +410,7 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 				if line > 1 || !bytes.HasPrefix(dockerfileContents, []byte("FROM ")) {
 					// hack: skip trying to build just the first FROM line
 					t.Run(fmt.Sprintf("%d", line), func(t *testing.T) {
-						testConformanceInternalBuild(ctx, t, cwd, store, client, dockerClient, fmt.Sprintf("%s.%d", buildahImage, line), fmt.Sprintf("%s.%d", dockerImage, line), fmt.Sprintf("%s.%d", imagebuilderImage, line), contextDir, dockerfileName, dockerfileContents[:i+1], test, line, i == len(dockerfileContents)-1, dockerVersion)
+						testConformanceInternalBuild(ctx, t, cwd, store, storeB, client, dockerClient, fmt.Sprintf("%s.%d", buildahImage, line), fmt.Sprintf("%s.%d", dockerImage, line), fmt.Sprintf("%s.%d", imagebuilderImage, line), contextDir, dockerfileName, dockerfileContents[:i+1], test, line, i == len(dockerfileContents)-1, dockerVersion)
 					})
 				}
 				line++
@@ -386,13 +418,13 @@ func testConformanceInternal(t *testing.T, dateStamp string, testIndex int, muta
 		}
 	} else {
 		// build to completion
-		testConformanceInternalBuild(ctx, t, cwd, store, client, dockerClient, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName, dockerfileContents, test, 0, true, dockerVersion)
+		testConformanceInternalBuild(ctx, t, cwd, store, storeB, client, dockerClient, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName, dockerfileContents, test, 0, true, dockerVersion)
 	}
 }
 
-func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string, store storage.Store, client *docker.Client, dockerClient *dockerdockerclient.Client, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName string, dockerfileContents []byte, test testCase, line int, finalOfSeveral bool, dockerVersion []string) {
-	var buildahLog, dockerLog, imagebuilderLog []byte
-	var buildahRef, dockerRef, imagebuilderRef types.ImageReference
+func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string, store storage.Store, storeB storage.Store, client *docker.Client, dockerClient *dockerdockerclient.Client, buildahImage, dockerImage, imagebuilderImage, contextDir, dockerfileName string, dockerfileContents []byte, test testCase, line int, finalOfSeveral bool, dockerVersion []string) {
+	var buildahLog, buildahLogB, dockerLog, imagebuilderLog []byte
+	var buildahRef, buildahRefB, dockerRef, imagebuilderRef types.ImageReference
 
 	// overwrite the Dockerfile in the build context for this run using the
 	// contents we were passed, which may only be an initial subset of the
@@ -427,61 +459,92 @@ func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string,
 		}
 	}()
 
+	var wg sync.WaitGroup
+
 	// build using docker
 	if !test.withoutDocker {
-		dockerRef, dockerLog = buildUsingDocker(ctx, t, client, dockerClient, test, dockerImage, contextDir, dockerfileName, line, finalOfSeveral)
-		if dockerRef != nil {
-			defer func() {
-				err := client.RemoveImageExtended(dockerImage, docker.RemoveImageOptions{
-					Context: ctx,
-					Force:   true,
-				})
-				assert.Nil(t, err, "error deleting newly-built-by-docker image %q", dockerImage)
-			}()
-		}
-		saveReport(ctx, t, dockerRef, filepath.Join(dockerDir, t.Name()), dockerfileContents, dockerLog, dockerVersion)
-		if finalOfSeveral && compareLayers {
-			saveReport(ctx, t, dockerRef, filepath.Join(dockerDir, t.Name(), ".."), dockerfileContents, dockerLog, dockerVersion)
-		}
-	}
-
-	if t.Failed() {
-		t.FailNow()
+		wg.Add(1)
+		go func() {
+			dockerRef, dockerLog = buildUsingDocker(ctx, t, client, dockerClient, test, dockerImage, contextDir, dockerfileName, line, finalOfSeveral)
+			saveReport(ctx, t, dockerRef, filepath.Join(dockerDir, t.Name()), dockerfileContents, dockerLog, dockerVersion)
+			if finalOfSeveral && compareLayers {
+				saveReport(ctx, t, dockerRef, filepath.Join(dockerDir, t.Name(), ".."), dockerfileContents, dockerLog, dockerVersion)
+			}
+			wg.Done()
+		}()
 	}
 
 	// build using imagebuilder if we're testing with it, too
 	if compareImagebuilder && !test.withoutImagebuilder {
-		imagebuilderRef, imagebuilderLog = buildUsingImagebuilder(t, client, test, imagebuilderImage, contextDir, dockerfileName, line, finalOfSeveral)
-		if imagebuilderRef != nil {
-			defer func() {
-				err := client.RemoveImageExtended(imagebuilderImage, docker.RemoveImageOptions{
-					Context: ctx,
-					Force:   true,
-				})
-				assert.Nil(t, err, "error deleting newly-built-by-imagebuilder image %q", imagebuilderImage)
-			}()
-		}
-		saveReport(ctx, t, imagebuilderRef, filepath.Join(imagebuilderDir, t.Name()), dockerfileContents, imagebuilderLog, dockerVersion)
+		wg.Add(1)
+		go func() {
+			imagebuilderRef, imagebuilderLog = buildUsingImagebuilder(t, client, test, imagebuilderImage, contextDir, dockerfileName, line, finalOfSeveral)
+			saveReport(ctx, t, imagebuilderRef, filepath.Join(imagebuilderDir, t.Name()), dockerfileContents, imagebuilderLog, dockerVersion)
+			if finalOfSeveral && compareLayers {
+				saveReport(ctx, t, imagebuilderRef, filepath.Join(imagebuilderDir, t.Name(), ".."), dockerfileContents, imagebuilderLog, dockerVersion)
+			}
+			wg.Done()
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		// always build using buildah
+		buildahRef, buildahLog = buildUsingBuildah(ctx, t, store, test, buildahImage, contextDir, dockerfileName, line, finalOfSeveral)
+		saveReport(ctx, t, buildahRef, filepath.Join(buildahDir, t.Name()), dockerfileContents, buildahLog, nil)
 		if finalOfSeveral && compareLayers {
-			saveReport(ctx, t, imagebuilderRef, filepath.Join(imagebuilderDir, t.Name(), ".."), dockerfileContents, imagebuilderLog, dockerVersion)
+			saveReport(ctx, t, buildahRef, filepath.Join(buildahDir, t.Name(), ".."), dockerfileContents, buildahLog, nil)
 		}
+		wg.Done()
+	}()
+
+	if reproducibleBuild {
+		time.Sleep(2 * time.Second)
+		wg.Add(1)
+		go func() {
+			buildahRefB, buildahLogB = buildUsingBuildah(ctx, t, storeB, test, buildahImage, contextDir, dockerfileName, line, finalOfSeveral)
+			saveReport(ctx, t, buildahRefB, filepath.Join(buildahDirB, t.Name()), dockerfileContents, buildahLogB, nil)
+			if finalOfSeveral && compareLayers {
+				saveReport(ctx, t, buildahRefB, filepath.Join(buildahDirB, t.Name(), ".."), dockerfileContents, buildahLogB, nil)
+			}
+			wg.Done()
+		}()
 	}
 
-	if t.Failed() {
-		t.FailNow()
+	wg.Wait()
+
+	if dockerRef != nil {
+		defer func() {
+			err := client.RemoveImageExtended(dockerImage, docker.RemoveImageOptions{
+				Context: ctx,
+				Force:   true,
+			})
+			assert.Nil(t, err, "error deleting newly-built-by-docker image %q", dockerImage)
+		}()
 	}
 
-	// always build using buildah
-	buildahRef, buildahLog = buildUsingBuildah(ctx, t, store, test, buildahImage, contextDir, dockerfileName, line, finalOfSeveral)
+	if imagebuilderRef != nil {
+		defer func() {
+			err := client.RemoveImageExtended(imagebuilderImage, docker.RemoveImageOptions{
+				Context: ctx,
+				Force:   true,
+			})
+			assert.Nil(t, err, "error deleting newly-built-by-imagebuilder image %q", imagebuilderImage)
+		}()
+	}
+
 	if buildahRef != nil {
 		defer func() {
 			err := buildahRef.DeleteImage(ctx, nil)
 			assert.Nil(t, err, "error deleting newly-built-by-buildah image %q", buildahImage)
 		}()
 	}
-	saveReport(ctx, t, buildahRef, filepath.Join(buildahDir, t.Name()), dockerfileContents, buildahLog, nil)
-	if finalOfSeveral && compareLayers {
-		saveReport(ctx, t, buildahRef, filepath.Join(buildahDir, t.Name(), ".."), dockerfileContents, buildahLog, nil)
+
+	if buildahRefB != nil {
+		defer func() {
+			err := buildahRefB.DeleteImage(ctx, nil)
+			assert.Nil(t, err, "error deleting newly-built-by-buildah image %q", buildahImage)
+		}()
 	}
 
 	if t.Failed() {
@@ -531,15 +594,15 @@ func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string,
 
 		miss, left, diff, same := compareJSON(originalDockerConfig, originalBuildahConfig, originalSkip)
 		if !same {
-			assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "buildah"))
+			assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "Docker", "buildah"))
 		}
 		miss, left, diff, same = compareJSON(ociDockerConfig, ociBuildahConfig, ociSkip)
 		if !same {
-			assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "buildah"))
+			assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "Docker", "buildah"))
 		}
 		miss, left, diff, same = compareJSON(fsDocker, fsBuildah, append(fsSkip, test.fsSkip...))
 		if !same {
-			assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "buildah"))
+			assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "Docker", "buildah"))
 		}
 	}
 
@@ -558,15 +621,41 @@ func testConformanceInternalBuild(ctx context.Context, t *testing.T, cwd string,
 		// compare the reports between docker and imagebuilder
 		miss, left, diff, same := compareJSON(originalDockerConfig, originalImagebuilderConfig, originalSkip)
 		if !same {
-			assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "imagebuilder"))
+			assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "Docker", "imagebuilder"))
 		}
 		miss, left, diff, same = compareJSON(ociDockerConfig, ociImagebuilderConfig, ociSkip)
 		if !same {
-			assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "imagebuilder"))
+			assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "Docker", "imagebuilder"))
 		}
 		miss, left, diff, same = compareJSON(fsDocker, fsImagebuilder, append(fsSkip, test.fsSkip...))
 		if !same {
-			assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "imagebuilder"))
+			assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "Docker", "imagebuilder"))
+		}
+	}
+
+	if reproducibleBuild {
+		_, originalBuildahConfig, ociBuildahConfig, fsBuildah := readReport(t, filepath.Join(buildahDir, t.Name()))
+		if t.Failed() {
+			t.FailNow()
+		}
+
+		_, originalBuildahBConfig, ociBuildahBConfig, fsBuildahB := readReport(t, filepath.Join(buildahDirB, t.Name()))
+		if t.Failed() {
+			t.FailNow()
+		}
+
+		// compare the reports between docker and imagebuilder
+		miss, left, diff, same := compareJSON(originalBuildahConfig, originalBuildahBConfig, []string{})
+		if !same {
+			assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "Buildah", "Buildah-2s-later"))
+		}
+		miss, left, diff, same = compareJSON(ociBuildahConfig, ociBuildahBConfig, []string{})
+		if !same {
+			assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "Buildah", "Buildah-2s-later"))
+		}
+		miss, left, diff, same = compareJSON(fsBuildah, fsBuildahB, []string{})
+		if !same {
+			assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "Buildah", "Buildah-2s-later"))
 		}
 	}
 }
@@ -630,6 +719,7 @@ func buildUsingBuildah(ctx context.Context, t *testing.T, store storage.Store, t
 		CompatVolumes:           test.compatVolumes,
 		CompatScratchConfig:     test.compatScratchConfig,
 		Args:                    maps.Clone(test.buildArgs),
+		Timestamp:               &testDate,
 	}
 	// build the image and gather output. log the output if the build part of the test failed
 	imageID, _, err := imagebuildah.BuildDockerfiles(ctx, store, options, dockerfileName)
@@ -1316,10 +1406,10 @@ func compareJSON(a, b map[string]interface{}, skip []string) (missKeys, leftKeys
 			}
 			m := make(map[interface{}]struct{})
 			for i := 0; i < len(tmpb); i++ {
-				m[tmpb[i]] = struct{}{}
+				m[fmt.Sprintf("%#v", tmpb[i])] = struct{}{}
 			}
 			for i := 0; i < len(tmpa); i++ {
-				if _, ok := m[tmpa[i]]; !ok {
+				if _, ok := m[fmt.Sprintf("%#v", tmpa[i])]; !ok {
 					diffKeys = append(diffKeys, diffDebug(k, v, vb))
 					isSame = false
 					break
@@ -1347,18 +1437,18 @@ func compareJSON(a, b map[string]interface{}, skip []string) (missKeys, leftKeys
 }
 
 // configCompareResult summarizes the output of compareJSON for display
-func configCompareResult(miss, left, diff []string, notDocker string) string {
+func configCompareResult(miss, left, diff []string, buildEngineA, buildEngineB string) string {
 	var buffer bytes.Buffer
 	if len(miss) > 0 {
-		buffer.WriteString(fmt.Sprintf("Fields missing from %s version: %s\n", notDocker, strings.Join(miss, " ")))
+		buffer.WriteString(fmt.Sprintf("Fields missing from %s version: %s\n", buildEngineB, strings.Join(miss, " ")))
 	}
 	if len(left) > 0 {
-		buffer.WriteString(fmt.Sprintf("Fields which only exist in %s version: %s\n", notDocker, strings.Join(left, " ")))
+		buffer.WriteString(fmt.Sprintf("Fields which only exist in %s version: %s\n", buildEngineB, strings.Join(left, " ")))
 	}
 	if len(diff) > 0 {
 		buffer.WriteString("Fields present in both versions have different values:\n")
 		tw := tabwriter.NewWriter(&buffer, 1, 1, 8, ' ', 0)
-		if _, err := tw.Write([]byte(fmt.Sprintf("Field\tDocker\t%s\n", notDocker))); err != nil {
+		if _, err := tw.Write([]byte(fmt.Sprintf("Field\t%s\t%s\n", buildEngineA, buildEngineB))); err != nil {
 			panic(err)
 		}
 		for _, d := range diff {
@@ -1372,7 +1462,7 @@ func configCompareResult(miss, left, diff []string, notDocker string) string {
 }
 
 // fsCompareResult summarizes the output of compareJSON for display
-func fsCompareResult(miss, left, diff []string, notDocker string) string {
+func fsCompareResult(miss, left, diff []string, buildEngineA, buildEngineB string) string {
 	var buffer bytes.Buffer
 	fixup := func(names []string) []string {
 		n := make([]string, 0, len(names))
@@ -1382,15 +1472,15 @@ func fsCompareResult(miss, left, diff []string, notDocker string) string {
 		return n
 	}
 	if len(miss) > 0 {
-		buffer.WriteString(fmt.Sprintf("Content missing from %s version: %s\n", notDocker, strings.Join(fixup(miss), " ")))
+		buffer.WriteString(fmt.Sprintf("Content missing from %s version: %s\n", buildEngineB, strings.Join(fixup(miss), " ")))
 	}
 	if len(left) > 0 {
-		buffer.WriteString(fmt.Sprintf("Content which only exists in %s version: %s\n", notDocker, strings.Join(fixup(left), " ")))
+		buffer.WriteString(fmt.Sprintf("Content which only exists in %s version: %s\n", buildEngineB, strings.Join(fixup(left), " ")))
 	}
 	if len(diff) > 0 {
 		buffer.WriteString("File attributes in both versions have different values:\n")
 		tw := tabwriter.NewWriter(&buffer, 1, 1, 8, ' ', 0)
-		if _, err := tw.Write([]byte(fmt.Sprintf("File:attr\tDocker\t%s\n", notDocker))); err != nil {
+		if _, err := tw.Write([]byte(fmt.Sprintf("File:attr\t%s\t%s\n", buildEngineA, buildEngineB))); err != nil {
 			panic(err)
 		}
 		for _, d := range fixup(diff) {
@@ -4200,15 +4290,15 @@ func TestCommit(t *testing.T) {
 			_, originalBuildahConfig, ociBuildahConfig, fsBuildah := readReport(t, filepath.Join(buildahDir, t.Name()))
 			miss, left, diff, same := compareJSON(originalDockerConfig, originalBuildahConfig, originalSkip)
 			if !same {
-				assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "buildah"))
+				assert.Failf(t, "Image configurations differ as committed in Docker format", configCompareResult(miss, left, diff, "Docker", "buildah"))
 			}
 			miss, left, diff, same = compareJSON(ociDockerConfig, ociBuildahConfig, ociSkip)
 			if !same {
-				assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "buildah"))
+				assert.Failf(t, "Image configurations differ when converted to OCI format", configCompareResult(miss, left, diff, "Docker", "buildah"))
 			}
 			miss, left, diff, same = compareJSON(fsDocker, fsBuildah, fsSkip)
 			if !same {
-				assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "buildah"))
+				assert.Failf(t, "Filesystem contents differ", fsCompareResult(miss, left, diff, "Docker", "buildah"))
 			}
 		})
 	}
